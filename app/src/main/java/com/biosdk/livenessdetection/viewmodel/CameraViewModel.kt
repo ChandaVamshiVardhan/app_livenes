@@ -31,8 +31,20 @@ data class CameraUiState(
     val timeLeft: Int = 15,
     val isConnected: Boolean = false,
     val error: String? = null,
-    val savedFilePath: String? = null
+    val savedFilePath: String? = null,
+    val faceDetected: Boolean = false,
+    val faceConfidence: Float = 0f,
+    val sessionState: SessionState = SessionState.WAITING_FOR_FACE,
+    val currentFps: Double = 0.0
 )
+
+enum class SessionState {
+    WAITING_FOR_FACE,
+    FACE_DETECTED,
+    SESSION_STARTING,
+    SESSION_ACTIVE,
+    SESSION_COMPLETED
+}
 
 class CameraViewModel(private val context: Context) : ViewModel() {
     private val TAG = "CameraViewModel"
@@ -45,13 +57,49 @@ class CameraViewModel(private val context: Context) : ViewModel() {
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
     
+    private var framesSentCount = 0
+    private var lastFpsCalculation = System.currentTimeMillis()
+    private var faceDetectionCount = 0
+    private val requiredFaceDetections = 10 // Require 10 consecutive face detections before starting session
+    
     init {
         Log.d(TAG, "Initializing CameraViewModel")
-        startSession()
+    }
+
+    fun onFaceDetected(detected: Boolean, confidence: Float) {
+        if (detected && confidence > 0.7f) {
+            faceDetectionCount++
+            _uiState.update { it.copy(
+                faceDetected = true,
+                faceConfidence = confidence
+            )}
+            
+            // Start session after consistent face detection
+            if (faceDetectionCount >= requiredFaceDetections && 
+                _uiState.value.sessionState == SessionState.WAITING_FOR_FACE) {
+                Log.d(TAG, "Face consistently detected, starting session...")
+                _uiState.update { it.copy(sessionState = SessionState.FACE_DETECTED) }
+                startSession()
+            }
+        } else {
+            faceDetectionCount = 0
+            _uiState.update { it.copy(
+                faceDetected = false,
+                faceConfidence = confidence
+            )}
+            
+            // Reset session if face is lost during recording
+            if (_uiState.value.sessionState == SessionState.SESSION_ACTIVE && !detected) {
+                Log.d(TAG, "Face lost during session, stopping...")
+                stopRecording()
+            }
+        }
     }
 
     private fun startSession() {
         Log.d(TAG, "Starting new session...")
+        _uiState.update { it.copy(sessionState = SessionState.SESSION_STARTING) }
+        
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val request = Request.Builder()
@@ -72,14 +120,20 @@ class CameraViewModel(private val context: Context) : ViewModel() {
                     } else {
                         Log.e(TAG, "Failed to start session: ${response.code}")
                         withContext(Dispatchers.Main) {
-                            _uiState.update { it.copy(error = "Failed to start session") }
+                            _uiState.update { it.copy(
+                                error = "Failed to start session",
+                                sessionState = SessionState.WAITING_FOR_FACE
+                            )}
                         }
                     }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error starting session", e)
                 withContext(Dispatchers.Main) {
-                    _uiState.update { it.copy(error = "Error starting session: ${e.message}") }
+                    _uiState.update { it.copy(
+                        error = "Error starting session: ${e.message}",
+                        sessionState = SessionState.WAITING_FOR_FACE
+                    )}
                 }
             }
         }
@@ -88,7 +142,6 @@ class CameraViewModel(private val context: Context) : ViewModel() {
     private fun connectWebSocket() {
         if (sessionId == null) {
             Log.d(TAG, "Cannot connect WebSocket without session ID")
-            startSession()
             return
         }
         
@@ -106,7 +159,11 @@ class CameraViewModel(private val context: Context) : ViewModel() {
                     override fun onOpen(webSocket: WebSocket, response: Response) {
                         Log.d(TAG, "WebSocket connection opened")
                         viewModelScope.launch(Dispatchers.Main) {
-                            _uiState.update { it.copy(isConnected = true) }
+                            _uiState.update { it.copy(
+                                isConnected = true,
+                                sessionState = SessionState.SESSION_ACTIVE
+                            )}
+                            startRecording()
                         }
                     }
 
@@ -116,13 +173,17 @@ class CameraViewModel(private val context: Context) : ViewModel() {
                             val jsonResponse = JSONObject(text)
                             if (jsonResponse.has("status") && jsonResponse.getString("status") == "completed") {
                                 Log.d(TAG, "Session completed, getting results")
+                                viewModelScope.launch(Dispatchers.Main) {
+                                    _uiState.update { it.copy(sessionState = SessionState.SESSION_COMPLETED) }
+                                }
                                 getSessionResults()
                             } else {
                                 viewModelScope.launch(Dispatchers.Main) {
                                     _uiState.update { state ->
                                         state.copy(
                                             livenessScore = jsonResponse.optInt("liveness_score", state.livenessScore),
-                                            frameCount = jsonResponse.optInt("frame_number", state.frameCount)
+                                            frameCount = jsonResponse.optInt("frame_number", state.frameCount),
+                                            currentFps = jsonResponse.optDouble("current_fps", state.currentFps)
                                         )
                                     }
                                 }
@@ -135,39 +196,39 @@ class CameraViewModel(private val context: Context) : ViewModel() {
                     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                         Log.e(TAG, "WebSocket error: ${t.message}", t)
                         viewModelScope.launch(Dispatchers.Main) {
-                            _uiState.update { it.copy(isConnected = false, error = "WebSocket error: ${t.message}") }
+                            _uiState.update { it.copy(
+                                isConnected = false, 
+                                error = "WebSocket error: ${t.message}",
+                                sessionState = SessionState.WAITING_FOR_FACE
+                            )}
                         }
                     }
 
                     override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                         Log.d(TAG, "WebSocket closed: $reason")
+                        viewModelScope.launch(Dispatchers.Main) {
+                            _uiState.update { it.copy(isConnected = false) }
+                        }
                     }
                 })
             } catch (e: Exception) {
                 Log.e(TAG, "Error connecting to WebSocket", e)
                 withContext(Dispatchers.Main) {
-                    _uiState.update { it.copy(error = "Error connecting to WebSocket: ${e.message}") }
+                    _uiState.update { it.copy(
+                        error = "Error connecting to WebSocket: ${e.message}",
+                        sessionState = SessionState.WAITING_FOR_FACE
+                    )}
                 }
             }
         }
     }
     
-    fun startRecording() {
-        Log.d(TAG, "Starting recording...")
-        if (sessionId == null) {
-            Log.d(TAG, "No session ID, starting new session")
-            startSession()
-            return
-        }
-        
-        if (!_uiState.value.isConnected) {
-            Log.d(TAG, "WebSocket not connected, reconnecting")
-            connectWebSocket()
-            return
-        }
-        
-        Log.d(TAG, "Starting recording with session ID: $sessionId")
+    private fun startRecording() {
+        Log.d(TAG, "Starting 15-second recording...")
         _uiState.update { it.copy(isRecording = true, timeLeft = 15) }
+        framesSentCount = 0
+        lastFpsCalculation = System.currentTimeMillis()
+        
         viewModelScope.launch {
             for (i in 15 downTo 0) {
                 if (!_uiState.value.isRecording) break
@@ -176,7 +237,7 @@ class CameraViewModel(private val context: Context) : ViewModel() {
                     Log.d(TAG, "Recording time completed, stopping...")
                     stopRecording()
                 }
-                kotlinx.coroutines.delay(1000)
+                delay(1000)
             }
         }
     }
@@ -188,39 +249,15 @@ class CameraViewModel(private val context: Context) : ViewModel() {
         Log.d(TAG, "Stop signal sent to WebSocket")
     }
 
-    private fun getSessionStatus() {
-        Log.d(TAG, "Getting session status...")
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val request = Request.Builder()
-                    .url("http://biosdk.credissuer.com:8001/session/${sessionId}")
-                    .header("accept", "application/json")
-                    .build()
-
-                Log.d(TAG, "Making HTTP request to get session status")
-                client.newCall(request).execute().use { response ->
-                    if (response.isSuccessful) {
-                        val jsonResponse = JSONObject(response.body?.string())
-                        val status = jsonResponse.getString("status")
-                        val isActive = jsonResponse.getBoolean("is_active")
-                        val frameCount = jsonResponse.getInt("frame_count")
-                        val currentFps = jsonResponse.getDouble("current_fps")
-                        
-                        Log.d(TAG, "Session status: $status, Active: $isActive, Frames: $frameCount, FPS: $currentFps")
-                        
-                        withContext(Dispatchers.Main) {
-                            _uiState.update { it.copy(
-                                frameCount = frameCount,
-                                isConnected = isActive
-                            )}
-                        }
-                    } else {
-                        Log.e(TAG, "Failed to get session status: ${response.code}")
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error getting session status", e)
-            }
+    fun resetSession() {
+        Log.d(TAG, "Resetting session...")
+        stopRecording()
+        webSocket?.close(1000, "Session reset")
+        sessionId = null
+        faceDetectionCount = 0
+        framesSentCount = 0
+        _uiState.update { 
+            CameraUiState(sessionState = SessionState.WAITING_FOR_FACE)
         }
     }
 
@@ -238,7 +275,6 @@ class CameraViewModel(private val context: Context) : ViewModel() {
                 Log.d(TAG, "Making HTTP request to get results")
                 client.newCall(request).execute().use { response ->
                     if (response.isSuccessful) {
-                        // Get filename from Content-Disposition header or generate one
                         val fileName = response.header("content-disposition")
                             ?.substringAfter("filename=")
                             ?.trim('"')
@@ -246,7 +282,6 @@ class CameraViewModel(private val context: Context) : ViewModel() {
                         
                         Log.d(TAG, "Results retrieved successfully. Saving file: $fileName")
 
-                        // Create Downloads directory if it doesn't exist
                         val downloadsDir = File(context.getExternalFilesDir(null), "Downloads")
                         if (!downloadsDir.exists()) {
                             downloadsDir.mkdirs()
@@ -260,18 +295,14 @@ class CameraViewModel(private val context: Context) : ViewModel() {
                         }
                                 
                         Log.d(TAG, "Excel file saved successfully at: ${file.absolutePath}")
-                        
-                        // Make file visible in Downloads
                         makeFileVisibleInDownloads(file)
                         
                         withContext(Dispatchers.Main) {
                             _uiState.update { it.copy(savedFilePath = file.absolutePath) }
                         }
                         
-                        // Close WebSocket before stopping session
                         webSocket?.close(1000, "Session completed")
-                        delay(1000) // Give WebSocket time to close
-                        
+                        delay(1000)
                         stopSession()
                     } else if (response.code == 400) {
                         Log.d(TAG, "Processing not completed yet, will retry...")
@@ -297,11 +328,10 @@ class CameraViewModel(private val context: Context) : ViewModel() {
         Log.d(TAG, "Stopping session...")
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                // Ensure WebSocket is closed
                 webSocket?.close(1000, "Session stopped")
                 
                 val request = Request.Builder()
-                    .url("http://biosdk.credissuer.com:8001/stop-session/${sessionId}?keep=true") // Changed to keep=true to preserve results
+                    .url("http://biosdk.credissuer.com:8001/stop-session/${sessionId}?keep=true")
                     .post(RequestBody.create("application/json".toMediaType(), ""))
                     .header("accept", "application/json")
                     .build()
@@ -323,42 +353,29 @@ class CameraViewModel(private val context: Context) : ViewModel() {
     }
 
     fun sendFrame(frameData: ByteArray) {
-        if (_uiState.value.isRecording && sessionId != null) {
-            if (!_uiState.value.isConnected) {
-                Log.d(TAG, "WebSocket not connected, attempting to reconnect")
-                connectWebSocket()
-                return
-            }
-            
+        if (_uiState.value.isRecording && sessionId != null && _uiState.value.isConnected) {
             try {
-                // Convert frame data to base64 string
                 val base64Frame = android.util.Base64.encodeToString(frameData, android.util.Base64.NO_WRAP)
                 val sent = webSocket?.send(base64Frame) ?: false
                 
                 if (sent) {
-                    _uiState.update { currentState ->
-                        val newFrameCount = currentState.frameCount + 1
-                        if (newFrameCount % 30 == 0) { // Log every 30 frames
-                            Log.d(TAG, "Sent frame $newFrameCount")
-                        }
-                        currentState.copy(frameCount = newFrameCount)
+                    framesSentCount++
+                    
+                    // Calculate FPS every second
+                    val currentTime = System.currentTimeMillis()
+                    if (currentTime - lastFpsCalculation >= 1000) {
+                        val fps = framesSentCount.toDouble() / ((currentTime - lastFpsCalculation) / 1000.0)
+                        lastFpsCalculation = currentTime
+                        framesSentCount = 0
+                        
+                        _uiState.update { it.copy(currentFps = fps) }
+                        Log.d(TAG, "Current FPS: $fps")
                     }
                 } else {
                     Log.e(TAG, "Failed to send frame")
-                    _uiState.update { it.copy(error = "Failed to send frame") }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error sending frame", e)
-                _uiState.update { it.copy(error = "Error sending frame: ${e.message}") }
-            }
-        } else {
-            if (!_uiState.value.isConnected) {
-                Log.d(TAG, "WebSocket not connected, attempting to reconnect")
-                connectWebSocket()
-            }
-            if (sessionId == null) {
-                Log.d(TAG, "No session ID, starting new session")
-                startSession()
             }
         }
     }
@@ -366,7 +383,6 @@ class CameraViewModel(private val context: Context) : ViewModel() {
     private fun makeFileVisibleInDownloads(file: File) {
         try {
             val targetFile = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                // Android 10 and above: Use MediaStore
                 val contentValues = android.content.ContentValues().apply {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
                     put(MediaStore.MediaColumns.MIME_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -384,7 +400,6 @@ class CameraViewModel(private val context: Context) : ViewModel() {
                 }
                 File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), file.name)
             } else {
-                // Below Android 10: Direct file copy
                 val downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
                 val targetFile = File(downloadDir, file.name)
                 file.copyTo(targetFile, overwrite = true)

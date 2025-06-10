@@ -40,3 +40,9 @@ data class StopSessionResponse(
 data class CompletionMessage(
     val status: String
 )
+
+data class FaceDetectionResult(
+    val faceDetected: Boolean,
+    val confidence: Float,
+    val boundingBox: android.graphics.Rect?
+)
